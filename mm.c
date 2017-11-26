@@ -25,6 +25,11 @@ typedef struct {
  size_t data;
 } block_header;
 
+typedef struct list_node {
+ struct list_node *prev;
+ struct list_node *next;
+} list_node;
+
 /* always use 16-byte alignment */
 #define ALIGNMENT 16
 
@@ -42,6 +47,7 @@ typedef struct {
 #define GO_TO_FTR(bp) ( HDRP(HDRP(NEXT_BLKP(bp))) )
 #define OVERHEAD (sizeof(block_header) * 2)
 #define FTRP(bp) ((char *)(bp)+GET_SIZE(HDRP(bp))-OVERHEAD)
+#define CHNK_HDRP(bp)  ((char*)(bp) - 3*sizeof(block_header))
 
 #define GET(p) (*(size_t *)(p))
 #define GET_DATA(bp) ((block_header*)bp)->data
@@ -53,7 +59,7 @@ typedef struct {
 
 #define CHUNK_SIZE (1 << 14)
 #define CHUNK_ALIGN(size) (((size)+(CHUNK_SIZE-1)) & ~(CHUNK_SIZE-1))
-#define CHUNK_OVERHEAD (sizeof(block_header) * 3)
+#define CHUNK_OVERHEAD (sizeof(block_header) * 5)
 #define BLK_HDR_SZ (sizeof(block_header))
 
 /* rounds down to the nearest multiple of mem_pagesize() */
@@ -147,14 +153,20 @@ int mm_init(void)
 static void* set_new_chunk(size_t new_size){
  // scanf("%c",&in);
   if(debug_enter) {printf("ENTER SET_NEW_CHUNK: %d\n", ++num_mm_int);}
-  block_header* chunk_prolog_hdr = mem_map(new_size);
 
-  //Place chunk header and prolog block, pack size and alloc, embed data specific to each blockgit
+
+  list_node* chunk_node1 = (list_node*)mem_map(new_size);
+  chunk_node1->next = NULL;  chunk_node1->prev = NULL;
+
+
+  list_node* chunk_node2 =  (list_node*)((void*)chunk_node1 + sizeof(list_node) );
+  chunk_node2->next = NULL;  chunk_node2->prev = NULL;
+
+  block_header* chunk_prolog_hdr = (block_header*)((void*)chunk_node1 + (2*sizeof(list_node)));
   PUT((void*)chunk_prolog_hdr, PACK(2*BLK_HDR_SZ, 1));
   GET_DATA(chunk_prolog_hdr) = new_size;             // REPRESENTS SIZE OF CHUNK
 
-  //Place end of chunk ftr
-  block_header* end_of_chunk_ftr = ((void*)chunk_prolog_hdr + new_size - sizeof(block_header));
+  block_header* end_of_chunk_ftr = ((void*)chunk_node1 + new_size - sizeof(block_header));
   PUT((void*)end_of_chunk_ftr, PACK(0, 1));
   GET_DATA(end_of_chunk_ftr) = 0;
 
@@ -169,7 +181,7 @@ static void* set_new_chunk(size_t new_size){
   PUT((void*)first_block, PACK(size_first_block, 0));
 
   // Place first bp
-  void* bp = HDRP(first_block);
+  void* bp = (void*)first_block + sizeof(block_header);
 
   // Place first block footer
   block_header* first_block_footer = (block_header*)FTRP(bp);
@@ -177,15 +189,17 @@ static void* set_new_chunk(size_t new_size){
 
   current_avail_size = size_first_block - OVERHEAD;
 
-  if(!ptr_is_mapped((void*)chunk_prolog_hdr, new_size)){
+  /*
+  if(!ptr_is_mapped((void*)list_node, new_size)){
     printf("FAILED TO SET NEW CHUNK, WAS UNMAPPED,  PTR: %p  SIZE: %zu\n", chunk_prolog_hdr, new_size);
     print_chunk_info(bp, 1, 1); 
 
-    mem_unmap((void*)chunk_prolog_hdr, new_size);
-    if(ptr_is_mapped((void*)chunk_prolog_hdr, new_size )){ printf("FAILED TO UNMAP ERRONEOUS MAPPING,  PTR: %p  SIZE: %zu\n", chunk_prolog_hdr, new_size);}
+    mem_unmap((void*)chunk_node1, new_size);
+    if(ptr_is_mapped((void*)list_node, new_size )){ printf("FAILED TO UNMAP ERRONEOUS MAPPING,  PTR: %p  SIZE: %zu\n", chunk_prolog_hdr, new_size);}
 
     return NULL;
   }
+  */
 
   return bp;
 }
@@ -198,27 +212,30 @@ void *mm_malloc(size_t size) {
    if(debug_enter) {printf("ENTER MALLOC:  %d\n", ++num_malloc);}  ;
  int new_size = ALIGN(size + OVERHEAD); int blk_cntr = 0;
  void *bp = first_bp;
+ list_node* prev_chunk = NULL;
+ list_node* curr_chunk = (void*)first_bp - 3*sizeof(block_header);
+ list_node* next_chunk = NULL;
 
-      while (GET_SIZE(HDRP(bp)) != 0 && ptr_is_mapped(bp, GET_SIZE(HDRP(bp))) ) {  // WHILE HAVE NOT REACHED END OF CHUNK
-         if (!GET_ALLOC(HDRP(bp)) && (GET_SIZE(HDRP(bp)) >= new_size)) { 
-           if(set_allocated(bp, new_size, blk_cntr)) 
-           return bp;
-           // Examine chunk
-         }
+
+      while (GET_SIZE(HDRP(bp)) != 0) {  // WHILE HAVE NOT REACHED END OF CHUNK
+
+        if(ptr_is_mapped(bp, sizeof(block_header)))  // is ptr mapped
+          if(ptr_is_mapped(bp, GET_SIZE(HDRP(bp)))) // is ptr and block mapped
+            if (!GET_ALLOC(HDRP(bp)) && (GET_SIZE(HDRP(bp)) >= new_size)) { 
+              if(set_allocated(bp, new_size, blk_cntr)) 
+              return bp;
+            }
          bp = NEXT_BLKP(bp);
 
       }
+ void* new_bp = extend(new_size); 
 
- print_chunk_info(bp, -1, 1);
- 
- void* new_bp = extend(new_size); int stuck_counter = 0;
- while(new_bp == NULL){ new_bp = extend(new_size); if(stuck_counter++ >= 10){printf("EXTEND FAILING TO ALLOCATE NEW CHUNK, x to break\n"); scanf("%c", &in);} if(in == 'x') break; }
-  
-
- GET_DATA(HDRP(bp)) = (size_t)new_bp;
-  
  if(set_allocated(new_bp, new_size, 0))
-  if(debug_on) {printf("Failed to set new chunk\n"); /*scanf("%c",&in);*/}
+ if(debug_on) {printf("Failed to set new chunk\n"); /*scanf("%c",&in);*/}
+
+ next_chunk = (void*)new_bp - 3*sizeof(block_header);
+ next_chunk->prev = curr_chunk;
+ curr_chunk->next = new_bp  - 3*sizeof(block_header);
 
  return new_bp;
 
@@ -227,10 +244,6 @@ void *mm_malloc(size_t size) {
 static int set_allocated(void *bp, size_t size, int blk_cntr) {
  if(debug_enter) {printf("ENTER SET_ALLLOC: %d\n", ++num_set_alloc);}    
  size_t extra_size = GET_SIZE(HDRP(bp)) - size;
-
- if(num_set_alloc == 209)
- printf("SIZE_REQUESTED%zu\n", size);
- //if(num_set_alloc == 1170) print_chunk_info(bp, -1, 1);
 
   if (extra_size > ALIGN(1 + OVERHEAD)) {  // SPLIT BLOCK
      if(!ptr_is_mapped(HDRP(bp), GET_SIZE( HDRP(bp) ))){ if(debug_on){printf("SET ALLOCATED SPLIT ALLOC UNAPPED\n");}
@@ -376,7 +389,7 @@ static void print_single_block(void* bp, int i)
 static void* blk_bp_to_chnk_bp(void* bp, int debug_level_)
 {
     if(debug_enter){printf("ENTERED GET CHUNK HDR: \n");}
-    scanf("%c", &in);
+
 
     printf("REVERSE @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
 
@@ -396,13 +409,13 @@ static void* blk_bp_to_chnk_bp(void* bp, int debug_level_)
           printf("ENTERD WHILE : %d\n", ++loop_count);
 
 
-        printf("ins 1\n");
+
         if(GET_SIZE(HDRP(bp)) == 0){
           printf("ERROR REVERSE CHUNK TRAVERSAL, REACHED BP SIZE:\n"); 
           print_single_block(bp, reverse_count);
         }
 
-        printf("ins 2\n");
+
         if(error_count++ > 200000){ //DEBUG / ERROR CODE, ININITE LOOPING  
           printf("GET CHUNK HDR LOOPING: \tGET_SIZE((bp)) != 2*BLK_HDR_SZ,) ->  %zu  !=  %zu\nsee next = n, break = any key, decrement 3 bps = 3: ", GET_SIZE(HDRP(bp)), 2*BLK_HDR_SZ); 
           scanf("%c", &in);  
@@ -411,17 +424,12 @@ static void* blk_bp_to_chnk_bp(void* bp, int debug_level_)
         }
 
 
-        printf("ins 3\n");
-        if(ptr_is_mapped(bp - OVERHEAD, sizeof(block_header)) ){
-          printf("ins 3.1\n");
 
+        if(ptr_is_mapped(bp - OVERHEAD, sizeof(block_header)) ){
 
           if(ptr_is_mapped(HDRP(PREV_BLKP(bp)) , sizeof(block_header))){ // CHECK IF PREV BLOCK, OR "NEXT BLOCK" IN REVERS TRAVERSAL IS MAPPED
-          printf("ins 3.2\n");          
-
 
           if(ptr_is_mapped(HDRP(PREV_BLKP(bp)) , GET_SIZE(HDRP(PREV_BLKP(bp))))  ){ // CHECK IF PREV BLOCK, OR "NEXT BLOCK" IN REVERS TRAVERSAL IS MAPPED)
-            printf("ins 3.3\n");          
               if( GET_SIZE(HDRP(PREV_BLKP(bp)) ) != GET_SIZE(bp - OVERHEAD)){ // SAFE TO DEREF, CHECK IF SIZES ARE EQUAL
                   printf("ERROR REVERSE CHUNK TRAVERSAL, SIZE MISMATCH ON NEXT BLOCK IN TRAVERSAL:\n");
                   print_single_block(bp, reverse_count);
@@ -470,7 +478,7 @@ static void print_chunk_info(void* bp, int debug_level_, int from_beginning)
 
      printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\n");
 
-     void* chunk_hdr = bp - CHUNK_OVERHEAD;
+     void* chunk_hdr = (void*)bp - 3*sizeof(block_header) ;
 
      printf("CHUNK HDR:\t ptr:%p\t\t\toff: %zu\t\t\t\tsize: %zu\t\t\talloc: %zu\t\t\t CHUNK SIZE: %zu\n", 
        chunk_hdr,
@@ -527,11 +535,27 @@ static int debugger(){
   return i++;
 }
 
+int block_mapped(void* p , size_t len)
+{
+  if(ptr_is_mapped(p, len)){
+    if(ptr_is_mapped(p, GET_SIZE(HDRP(p)))){
+      return 1;
+    }
+
+    return 0;
+  }
+
+
+}
+
+/* consider as macro?
+ *
+ */
 int ptr_is_mapped(void *p, size_t len) {
     void *s = ADDRESS_PAGE_START(p);
     return mem_is_mapped(s, PAGE_ALIGN((p + len) - s));
 }
 
 static size_t calc_offset(void* new_ptr){
-  return (void*)new_ptr - ((void*)first_bp - CHUNK_OVERHEAD);
+ return (void*)new_ptr - ((void*)first_bp - 3*sizeof(block_header));
 }
